@@ -1,0 +1,424 @@
+
+```{r}
+require(sp)
+require(ggmap)
+require(sf)
+require(rgeos)
+require(tidyr)
+require(dplyr)
+require(rgdal)
+require(stringr)
+require(auk)
+require(lubridate)
+require(reshape2)
+```
+
+```{r}
+bba1 <- readRDS("rds-files\\bba1.rds")
+bba2 <- readRDS("rds-files\\bba2.rds")
+comp.blocks <- read.csv("List of complete blocks for Maggie.csv")
+```
+
+
+
+Observation Coverage data
+```{r}
+bba1c <- bba1 %>%
+  mutate(coverage = ifelse(Minimum.coverage.1 == "Minimum", 
+                           1, 0))
+
+bba1c <- bba1c %>%
+  mutate(coverage = ifelse(Adequate.coverage == "Adequate", 
+                                2, coverage)) %>% 
+  mutate(coverage = replace_na(coverage, 0))
+sumc1 <- sum(bba1c$coverage)
+bba1c <- bba1c %>%  
+  mutate(coverage = coverage/sumc1)
+bba1c$coverage
+sum(bba1c$coverage)
+
+# atlas 2
+# old bba2 coverage calculation
+comp.quads <- comp.blocks %>%
+  mutate(Atlas.Block.Name = str_sub(Atlas.Block.Name, 1, -4))
+# comp.quads
+# create adequate and minimum classification for completed blocks
+# adequate is any quad with more than 3 completed blocks
+# Coverage is binary in atlas 2 is binary
+comp.quads <- comp.quads %>%
+  group_by(Atlas.Block.Name) %>%
+  mutate(count = n()) %>%
+  ungroup() %>%
+  mutate(quad.status = ifelse(count > 1, 2, count))
+comp.quads <- comp.quads %>% distinct()
+# comp.quads
+bba2c <- bba2 %>%
+  mutate(QuadNameCo = str_sub(QuadNameCo, 1, -4))
+  # mutate(coverage = 0) # 0 = "Nope"
+bba2c <- bba2c %>%
+  mutate(coverage = ifelse(QuadNameCo %in% comp.quads$Atlas.Block.Name, 1, 0))
+bba2c <- bba2c %>%
+  mutate(coverage = ifelse(QuadNameCo %in% comp.quads$Atlas.Block.Name
+                          	[comp.quads$quad.status ==2], 2,
+                          	coverage))
+sumc2 <- sum(bba2c$coverage)
+bba2c <- bba2c %>%
+  mutate(coverage = coverage/sumc2)
+bba2c$coverage
+sum(bba2c$coverage)
+```
+
+Converting to meters crs
+```{r}
+bba1m <- bba1c %>% st_transform(crs = 32619)
+bba1m$coverage
+bba1m <- bba1m %>%
+  mutate(centroid = st_centroid(geometry))
+
+coordinates <- st_coordinates(bba1m$centroid)
+
+bba1m$median.lon <- coordinates[, 1]
+bba1m$median.lat <- coordinates[, 2]
+
+# bba1m <- bba1m %>%
+#   mutate(median.lat = sapply(centroid, median_lat)) %>% # centroid = median coords
+#   mutate(median.lon = sapply(centroid, median_lon))
+# bba1m$median.lat
+
+# Atlas 2
+bba2m <- bba2c %>% st_transform(crs = 32619)
+bba2m <- bba2m %>%
+  mutate(centroid = st_centroid(geometry))
+coordinates <- st_coordinates(bba2m$centroid)
+
+bba2m$median.lon <- coordinates[, 1]
+bba2m$median.lat <- coordinates[, 2]
+bba2m
+```
+
+Conform bba1m and bba2m so they have the same blocks
+```{r}
+common.blocks <- intersect(bba1m$NAME, bba2m$QuadNameCo)
+bba1m <- bba1m[bba1m$NAME %in% common.blocks, ]
+bba2m <- bba2m[bba2m$QuadNameCo %in% common.blocks, ]
+
+bba1m <- bba1m[order(bba1m$NAME), ]
+bba2m <- bba2m[order(bba2m$QuadNameCo), ]
+bba1m
+bba2m
+```
+
+
+Add elevation column
+(This takes a couple minutes to run)
+```{r}
+library(FedData)
+library(stars)
+library(terra)
+library(sf)
+library(dplyr)
+library(raster)
+#load atlas grid and plot the blocks and quads
+
+# amap <- read_sf(dsn = '..\\Data\\Spatial Data\\blockupdate2019', layer = 'BBA_Blocks_20190418_OldManIsland') 
+ele <- get_ned(amap, label = 'ME') #DEM
+# ele
+ele.sf <- stars::st_as_stars(ele)
+bba2m.ele <- st_transform(bba2m, st_crs(ele.sf))
+ele.r <- raster::raster(ele)
+avg.ele <- vector()
+med.ele <- vector()
+# blocks <- vector
+for(i in 1:nrow(bba2m.ele)){
+  block <- bba2m.ele[i, ]
+  tmp <- crop(ele.r, block)
+  avg <- mean(values(tmp), na.rm = TRUE)
+  med <- median(values(tmp), na.rm = TRUE)
+  avg.ele <- c(avg.ele, avg)
+  med.ele <- c(med.ele, med)
+  # blocks <- c(blocks, block)
+}
+med.ele
+bba2m$avg.ele <- avg.ele
+bba2m$med.ele <- med.ele
+
+bba1m$avg.ele <- avg.ele
+bba2m$med.ele <- med.ele
+bba1m
+bba2m
+```
+Read in Land cover Data
+And create block.covs data.frame
+```{r}
+nlcd <- get_nlcd(amap, label = 'ME', year = '2019', dataset = 'landcover')
+# nlcd.sf <- stars::st_as_stars(nlcd)
+bba2m.nlcd <- st_transform(bba2m, st_crs(nlcd.sf))
+# nlcd.r <- raster::raster(nlcd)
+plot(nlcd.r)
+nlcd.sum <- table(values(nlcd.r)) #summarize the total cells of each land cover type
+
+# ids <- unlist(attr(nlcd.sum, 'dimnames'))
+# ids
+# plot(nlcd.r)
+#grab the names of the categories
+nlcd.cat <- data.frame(LC = unlist(attr(nlcd.r, 'dimnames'))) 
+
+
+# create a dataframe with just id numbers and land cover type
+# rat <- levels(nlcd)
+
+rat <- data.frame(rat)
+
+
+block.covs <- matrix(NA, nrow = nrow(bba2m.nlcd), ncol = nrow(rat)) 
+
+
+for(i in 1:nrow(bba2m.nlcd)){
+  block <- bba2m.nlcd[i, ]
+  tmp <- crop(nlcd, block)
+
+  tmp.sum <- table(values(tmp))
+  
+  tmp.sum <- data.frame(tmp.sum)
+  
+  tmp.sum <- tmp.sum %>%
+    mutate(Var1 = as.integer(as.character(Var1)))  
+  missing_ids <- setdiff(rat$ID, tmp.sum$Var1)
+  additional_rows <- data.frame(Var1 = missing_ids, Freq = 0)
+  tmp.sum <- rbind(tmp.sum, additional_rows)
+  tmp.sum <- tmp.sum[order(tmp.sum$Var1), ]
+
+  block.covs[i, ] <- tmp.sum$Freq
+}
+block.covs <- data.frame(block.covs)
+colnames(block.covs) <- rat$Class
+
+block.covs <- block.covs %>% 
+  mutate(geometry = bba2m$geometry)
+
+head(block.covs)
+```
+
+RUN FROM HERE DOWN TO AVOID RELOADING NLCD AND NED DATASETS
+
+Initialize function for calculating north and south boundaries
+```{r}
+# max is also true for calculating north / east lat/lon values
+calculate_boundary <- function(col, atlas, max) {
+  symb <- ensym(col)
+  if (max) {
+    atlas <- atlas %>%
+      arrange(desc({{ symb }}))
+  } else {
+    atlas <- atlas %>%
+      arrange({{ symb }})
+  }
+
+
+  atlas <- atlas %>%
+    slice_head(n = 10)
+  
+  val <- mean(atlas[[col]], na.rm = TRUE)
+  
+  return(val)
+}
+
+# north_boundary <- calculate_boundary('median.lat', bba2m, TRUE)
+# north_boundary
+```
+
+Calculate distance to coast for each quad centroid
+```{r}
+# load .shp file
+me_coast <- read_sf("tl_2019_us_coastline")
+me_coast <-  st_transform(me_coast, 32619)
+
+
+bba1m <- bba1m %>%
+  mutate(d.to.coast = st_distance(centroid, st_union(me_coast)))
+bba2m <- bba2m %>%
+  mutate(d.to.coast = st_distance(centroid, st_union(me_coast)))
+
+bba1m$d.to.coast <- as.numeric(bba1m$d.to.coast)
+bba2m$d.to.coast <- as.numeric(bba2m$d.to.coast)
+```
+
+
+Initialize distribution data.frames
+This chunk takes about a minute to run
+```{r}
+# create atlas 1 species list to iterate through
+start_col <- which(names(bba1c) == "American Black Duck")
+end_col <- which(names(bba1c) == "Yellow-throated Vireo")
+species.a1 <- colnames(bba1c)[start_col:end_col]
+# create atlas 1 species list to iterate through
+start_col <- which(names(bba2c) == "Acadian Flycatcher")
+end_col <- which(names(bba2c) == "Yellow Warbler")
+species.a2 <- colnames(bba2c)[start_col:end_col]
+# create a function to make distribution data.frames
+dist_df <- function(atlas, species) 
+{
+  # initialize empty vectors
+  centroids <- vector()
+  s.lat <- vector()
+  n.lat <- vector()
+  min.ele <- vector()
+  max.ele <- vector()
+  min.coast <- vector()
+  max.coast <- vector()
+  # min lon
+  w.lon <- vector()
+  # max lon
+  e.lon <- vector()
+  num_blocks <- vector()
+  avg.ele <- vector()
+  med.ele <- vector()
+  for(bird in species) {
+    # only include bird species that are at least possible
+    filtered.atlas <- atlas %>%
+      filter(!!sym(bird) > 0)
+    if (nrow(filtered.atlas) > 0) {
+      #THIS LINE IS CAUSING A BUG
+      center <- st_centroid(st_union(filtered.atlas$centroid))
+      s.boundary <- calculate_boundary(col = 'median.lat', atlas = filtered.atlas,
+                                       max = FALSE)
+      n.boundary <- calculate_boundary(col = 'median.lat', atlas = filtered.atlas,
+                                         max = TRUE)
+      w.boundary <- calculate_boundary(col = 'median.lon', atlas = filtered.atlas,
+                                       max = FALSE)
+      e.boundary <- calculate_boundary(col = 'median.lon', atlas = filtered.atlas,
+                                       max = TRUE)
+      minimum.ele <- calculate_boundary(col = 'avg.ele', atlas = filtered.atlas,
+                                       max = FALSE)
+      maximum.ele <- calculate_boundary(col = 'avg.ele', atlas = filtered.atlas,
+                                    max = TRUE)
+      minimum.coast <- calculate_boundary(col = 'd.to.coast', atlas =
+                                            filtered.atlas, max = FALSE)
+      maximum.coast <- calculate_boundary(col = 'd.to.coast', atlas =
+                                          filtered.atlas, max = TRUE)
+      blocks <- nrow(filtered.atlas)
+      # average of average elevations of each block that this bird is in
+      avg <- mean(filtered.atlas$avg.ele)
+    }
+    
+      # median of average elevations of each block that this bird is in
+    med <- median(filtered.atlas$avg.ele)
+    avg.ele <- c(avg.ele, avg)
+    med.ele <- c(med.ele, med)
+    num_blocks <- c(num_blocks, blocks)
+    centroids <- c(centroids, center)
+    s.lat <- c(s.lat, s.boundary)
+    n.lat <- c(n.lat, n.boundary)
+    w.lon <- c(w.lon, w.boundary)
+    e.lon <- c(e.lon, e.boundary)
+    min.ele <- c(min.ele, minimum.ele)
+    max.ele <- c(max.ele, maximum.ele)
+    min.coast <- c(min.coast, minimum.coast)
+    max.coast <- c(max.coast, maximum.coast)
+
+  }
+  
+  dist <- data.frame(
+    species = species,
+    s.lat = s.lat,
+    n.lat = n.lat,
+    num.blocks = num_blocks,
+    avg.ele = avg.ele,
+    med.ele = med.ele,
+    w.lon = w.lon,
+    e.lon = e.lon,
+    min.ele = min.ele,
+    max.ele = max.ele,
+    min.coast = min.coast,
+    max.coast = max.coast
+  )
+  dist$geometry <- st_sfc(centroids, crs = 32619)
+  dist <- st_as_sf(dist, sf_column_name = "geometry")
+  # dist$geometry
+  # names(dist)
+  dist <- dist %>%
+    mutate(lon = st_coordinates(geometry)[,1],
+           lat = st_coordinates(geometry)[,2])
+  return(dist)
+}
+
+bba1m.dist <- dist_df(bba1m, species.a1)
+bba2m.dist <- dist_df(bba2m, species.a2)
+bba1m.dist
+bba2m.dist
+```
+
+
+
+
+# add taxonomic categorization
+```{r}
+tax <- read.csv("..\\Rosenberg et al species list.csv")
+head(tax)
+
+# merge with both distribution data sets
+bba1m.dist <- merge(bba1m.dist, tax, by = "species")
+bba2m.dist <- merge(bba2m.dist, tax, by = "species")
+head(bba1m.dist)
+head(bba2m.dist)
+```
+
+
+Create data.frames of only species that occur in both atlases
+```{r}
+# create data.frames that can be merged by cutting out a whole bunch of data
+common.a1 <- bba1m.dist %>%
+  filter(species %in% bba2m.dist$species)
+
+common.a2 <- bba2m.dist %>%
+  filter(species %in% bba1m.dist$species)
+```
+
+
+Create distance to coast column
+```{r}
+
+common.a1 <- common.a1 %>%
+  mutate(d.to.coast = st_distance(geometry, st_union(me_coast)))
+common.a2 <- common.a2 %>%
+  mutate(d.to.coast = st_distance(geometry, st_union(me_coast)))
+
+common.a1$d.to.coast <- as.numeric(common.a1$d.to.coast)
+common.a2$d.to.coast <- as.numeric(common.a2$d.to.coast)
+
+# calculate change, and add only to common.a2
+# common.a2$change_d_coast <- (common.a1$d.to.coast - common.a2$d.to.coast)/1000
+
+
+# repeat process for block centroids
+
+bba1m <- bba1m %>% 
+  mutate(d.to.coast = st_distance(centroid, st_union(me_coast)))
+bba2m <- bba2m %>% 
+  mutate(d.to.coast = st_distance(centroid, st_union(me_coast)))
+
+
+```
+
+
+
+
+
+
+
+Export the files
+```{r}
+saveRDS(object = bba1m, file = "rds-files\\bba1m.rds")
+saveRDS(object = bba2m, file = "rds-files\\bba2m.rds")
+saveRDS(object = bba1m.dist, file = "rds-files\\bba1m_distribution.rds")
+saveRDS(object = bba2m.dist, file = "rds-files\\bba2m_distribution.rds")
+saveRDS(object = common.a1, file = "rds-files\\common_species1.rds")
+saveRDS(object = common.a2, file = "rds-files\\common_species2.rds")
+saveRDS(object = block.covs, file = "rds-files\\block.covs.rds")
+saveRDS(object = block.covs, file = "rds-files\\land_coverage_by_block.rds")
+
+```
+
+
+
+

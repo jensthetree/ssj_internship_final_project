@@ -1,0 +1,1278 @@
+This analysis starts right after the creation of the coverage centroids plot on
+slide 16 of Chart Dump.
+
+
+```{r}
+require(sp)
+require(ggmap)
+require(sf)
+require(rgeos)
+require(tidyr)
+require(dplyr)
+require(rgdal)
+require(stringr)
+require(auk)
+require(lubridate)
+require(reshape2)
+require(lme4)
+require(DHARMa)
+library(gridExtra)
+```
+
+Set the crs used in all analysis as a memorable variable.
+Set a boolean varialbe for if the markdown should generate hundreds of species and
+family specific maps.
+```{r}
+crs.m <- 32619
+generate.maps <- FALSE
+```
+
+Read in data 
+```{r}
+bba1m <- readRDS("rds-files\\bba1m.rds")
+
+block.covs <- readRDS("rds-files\\block.covs.rds")
+bba2m <- readRDS("rds-files\\bba2m.rds")
+
+bba1m.dist <- readRDS("rds-files\\bba1m_distribution.rds")
+bba2m.dist <- readRDS("rds-files\\bba2m_distribution.rds")
+common.a1 <- readRDS("rds-files\\common_species1.rds")
+common.a2 <- readRDS("rds-files\\common_species2.rds")
+block.covs <- readRDS("rds-files\\land_coverage_by_block.rds")
+
+
+shape <- read_sf(dsn = "..\\state_outline", layer = "State_Outline_v5")
+
+
+
+```
+Initialize map of Maine with A2 quads
+```{r}
+shape <- st_transform(shape, crs = st_crs(bba2m))
+maine <- shape %>% 
+  filter(STATE == 'Maine')
+
+maine_shape <- ggplot(maine) +
+  geom_sf(fill = NA, color = "black") +
+  theme_minimal()
+
+maine_quads <- ggplot(maine) +
+  geom_sf(fill = NA, color = "black") +
+  geom_sf(data = bba2m, aes(geometry = geometry), color = "grey", fill = NA) +
+  theme_minimal()
+
+
+maine_quads
+```
+
+
+Read in ME coast shapefile 
+https://catalog.data.gov/dataset/tiger-line-shapefile-2019-nation-u-s-coastline-national-shapefile
+
+Also counties from 
+https://www.census.gov/geographies/mapping-files/time-series/geo/cartographic-boundary.html
+```{r}
+# make a simple map of Maine counties
+me.county <- read_sf("counties-shape")
+me.county <- me.county %>% 
+  group_by(COUNTYFP) %>%
+  summarize(geometry = st_union(geometry))
+me.county <- st_transform(me.county, crs.m)
+# plot(me.county)
+ggplot(data = me.county) +
+  geom_sf() + geom_sf_text(aes(label = COUNTYFP), size = 3, color = 'black') +
+  labs(title = 'Map of Counties with Labels') + theme_minimal()
+```
+Visually compare coverage in A1 to county lines
+```{r}
+ggplot() +
+  geom_sf(data = bba1m, aes(geometry = geometry, 
+                            color = NA, fill = Minimum.coverage)) +
+  geom_sf(data = me.county, aes(geometry = geometry), color = "black",
+                                fill = NA, alpha = 0.0, show.legend = FALSE) +
+  theme_minimal()
+```
+
+Initialize by_county a function that performs a spatial join between 
+a given atlas and Maine's counties.
+```{r}
+by_county <- function(atlas, cut) {
+  atlas.county <- sf::st_drop_geometry(atlas)
+  if(cut) {
+    # cut data.frame down to a few columns: coverage and geographic variables
+    atlas.county <- subset(atlas.county, 
+                           select=c('coverage', 'centroid', 'avg.ele', 'd.to.coast'))
+  }
+  
+  
+  atlas.county <- atlas.county %>% 
+    # break the spatial point into numeric values
+    mutate(quad.lon = st_coordinates(centroid)[, 1]) %>% 
+    mutate(quad.lat = st_coordinates(centroid)[, 2])
+  atlas.county <-  st_as_sf(atlas.county)
+  # something is going wrong witht his join
+  atlas.county <- atlas.county %>%
+    st_join(me.county)
+  
+  # drop the centroid column
+  atlas.county$centroid <- NULL
+  atlas.county$coverage
+  
+  atlas.county <- atlas.county %>%
+    filter(!is.na(COUNTYFP))
+  return(atlas.county)
+}
+```
+
+There is an error in spatial join in the chunk above. A2 is picking up more quads in its spatial join than A1, and neither of them are gaining all quads.
+```{r}
+a1.c <- by_county(bba1m, TRUE)
+a2.c <- by_county(bba2m, TRUE)
+a1.quad.tally <- a1.c %>% 
+  group_by(COUNTYFP) %>% 
+  tally()
+a2.quad.tally <-  a2.c %>% 
+  group_by(COUNTYFP) %>% 
+  tally()
+quad.tally.dif <- a2.quad.tally$n - a1.quad.tally$n
+quad.tally.dif
+```
+
+Initialize a county based data frame containing:
+weighted centroids, weighted elevations, and weighted distance to coast data
+```{r}
+# load groupable data
+# c stands for county
+a1.c <- by_county(bba1m, TRUE)
+
+# normalize the coverage
+framed.c <- a1.c %>% 
+  group_by(COUNTYFP) %>% 
+  reframe(coverage = (coverage / mean(coverage)), quad.lon = quad.lon, 
+          quad.lat = quad.lat, avg.ele = avg.ele, d.to.coast = d.to.coast)
+
+a1.c <- framed.c %>% 
+  group_by(COUNTYFP) %>% 
+  reframe(avg.lon = mean(quad.lon * coverage),
+          avg.lat = mean(quad.lat * coverage),
+          w.ele.a1 = mean(avg.ele * coverage),
+          w.coast.a1 = mean(d.to.coast * coverage)
+          )
+
+a1.c <- as.data.frame(a1.c)
+
+a1.c <- st_as_sf(a1.c, coords = c(2:3), sf_column_name = 'w.centroid',
+                     crs = crs.m)
+
+# load in atlas 2 county data
+a2.c <- by_county(bba2m, TRUE)
+
+a2.c <- a2.c %>% 
+  group_by(COUNTYFP) %>% 
+  reframe(avg.to.coast = mean(d.to.coast),
+          # convert average elevation of a quad to average elevation of a county
+          avg.ele = mean(avg.ele)) 
+
+
+
+# COUNTYFP is in the same order for both a1 and a2
+me.county <- me.county %>% 
+  # this line defines A2 centroid as unbiased
+  mutate(w.centroid.a2 = st_centroid(geometry)) %>% 
+  mutate(w.centroid.a1 = a1.c$w.centroid) %>% 
+  mutate(w.coast.a1 = a1.c$w.coast.a1) %>% 
+  mutate(w.ele.a1 = a1.c$w.ele.a1) %>% 
+  # changing the names of a2 coast and elevation for clarity
+  mutate(w.coast.a2 = a2.c$avg.to.coast) %>% 
+  mutate(w.ele.a2 = a2.c$avg.ele)
+
+me.county
+
+```
+
+
+Plot the two weighted centroids for each county.
+The weights for atlas 2 are assumed to be evenly distributed
+```{r}
+ggplot() +
+  geom_sf(data = me.county, aes(geometry = geometry), color = "black", fill = NA, 
+          alpha = 0.0) +
+  
+  geom_sf(data = me.county, aes(geometry = w.centroid.a1), size = 1, shape = 21, 
+          color = "red", fill = "red") +
+  
+  geom_sf(data = me.county, aes(geometry = w.centroid.a2), color = "blue",
+          size = 1, shape = 21, fill = "blue") +
+  # scale_color_manual(breaks = c("A1", "A2"), values =  c("red", "blue")) +
+  ggtitle("Weighted County Centroids for A1 and A2") +
+  theme_minimal()
+```
+Calculate coverage bias for all 4 categories
+(lat, lon, elevation, distance from coast)
+Unique set of values for each county
+```{r}
+# a2 - a1 for all calculations
+me.county <- me.county %>% 
+  mutate(da.lon = st_coordinates(w.centroid.a2)[, 1] - 
+           st_coordinates(w.centroid.a1)[, 1]) %>% 
+  mutate(da.lat = st_coordinates(w.centroid.a2)[, 2] - 
+           st_coordinates(w.centroid.a1)[, 2]) %>% 
+  mutate(da.ele = w.ele.a2 - w.ele.a1) %>% 
+  mutate(da.coast = w.coast.a2 - w.coast.a1)
+me.county
+```
+
+Initialize a species list for each county
+and species_by_county: a function that takes in an atlas and its corresponding
+species list and returns a data.frame with the number of times each species 
+occurs in each county and the number of quads in that county.
+```{r}
+# create atlas 1 species list to iterate through
+start_col <- which(names(bba1m) == "American Black Duck")
+end_col <- which(names(bba1m) == "Yellow-throated Vireo")
+species.a1 <- colnames(bba1m)[start_col:end_col]
+# create atlas 2 species list to iterate through
+start_col <- which(names(bba2m) == "Acadian Flycatcher")
+end_col <- which(names(bba2m) == "Yellow Warbler" )
+species.a2 <- colnames(bba2m)[start_col:end_col]
+
+
+species_by_county <- function(atlas, species) {
+  sums.atlas <- subset(me.county, select=c('COUNTYFP'))
+  # find the number of quads a species is in for each county
+  for(s in species) {
+    atlas <- atlas %>%
+  	  mutate(across(all_of(s), ~ ifelse(is.na(.), 0, .))) %>%
+  	  mutate(across(all_of(s), ~ ifelse(. > 0, 1, 0)))
+  	single.sums <- atlas %>%
+    	group_by(COUNTYFP) %>%
+    	reframe(!!sym(s) := sum(!!sym(s)))
+  	sums.atlas <- left_join(sums.atlas, single.sums, by = "COUNTYFP")
+
+  }
+  # create a data.frame with a column n that contains the number of quads for each county
+  quads.c <- atlas %>% 
+      group_by(COUNTYFP) %>% 
+      tally()
+  quads.c <- sf::st_drop_geometry(quads.c)
+  sums.atlas <- left_join(sums.atlas, quads.c, by = 'COUNTYFP')
+  return(sums.atlas)
+  
+}
+```
+
+
+
+
+Produce sums.a1 and sums.a2 data.frames using species_by_county().
+These data.frames contain the number of quads a species occurs in within each county
+and the total number of quads each county contains.
+```{r}
+# load in fresh bbam datasets with counties
+# c stands for county
+a1.c <- by_county(bba1m, FALSE)
+a2.c <- by_county(bba2m, FALSE)
+
+
+sums.a1 <- species_by_county(a1.c, species.a1)
+sums.a2 <- species_by_county(a2.c, species.a2)
+sums.a2
+```
+
+
+
+Create 2 data.frames representing only species that occur in at least 40 quads
+```{r}
+# initialize frequent lists containing any species w 40 or more quads
+# b stands for biased
+b.freq.a1 <- common.a1 %>% 
+  filter(num.blocks > 39)
+b.freq.a2 <- common.a2 %>% 
+  filter(num.blocks > 39) 
+# cuts out 58 species leaving us with only 145 species
+
+# make sure they contain only species in both species lists
+common.species <- intersect(b.freq.a1$species, b.freq.a2$species)
+b.freq.a1 <- b.freq.a1 %>% 
+  filter(species %in% common.species)
+b.freq.a2 <- b.freq.a2 %>% 
+  filter(species %in% common.species)
+common.cols <- intersect(names(b.freq.a1), names(b.freq.a2))
+b.freq.a1 <- b.freq.a1[common.cols]
+b.freq.a2 <- b.freq.a2[common.cols]
+# ensure the same order of species
+b.freq.a1 <- b.freq.a1 %>% arrange(species)
+b.freq.a2 <- b.freq.a2 %>% arrange(species)
+# this last line ensures common.species is in the proper order
+# which will become important when applying bias adjustments
+common.species <- b.freq.a1$species
+
+b.freq.a2 <- b.freq.a2 %>% 
+  mutate(lat.change = lat - b.freq.a1$lat) %>% 
+  mutate(lon.change = lon - b.freq.a1$lon) %>% 
+  mutate(ele.change = avg.ele - b.freq.a1$avg.ele) %>% 
+  mutate(coast.change = d.to.coast - b.freq.a1$d.to.coast)
+```
+
+Create a bias weight for each species in each county
+and add them as new county columns to freq.a1 and freq.a2
+```{r}
+bias.weights <- data.frame(
+  COUNTYFP = sums.a1$COUNTYFP
+)
+# initialize biases as values in the range 0 - 1
+for (i in common.species) {
+  bias.weights[[i]]  <- (sums.a1[[i]] + sums.a2[[i]]) / (sums.a2$n * 2)
+}
+
+# find the total bias of each county
+bias.weights <- bias.weights %>% 
+  rowwise() %>% 
+  mutate(total_county_bias = sum(c_across(-1)))
+
+# scale each individual weight according to total county bias
+for (i in common.species) {
+  bias.weights[[i]] <- bias.weights[[i]] * bias.weights$total_county_bias
+}
+# scale biases such that the sum of each species bias = 1
+for (i in common.species) {
+  total <- sum(bias.weights[[i]])
+  bias.weights[[i]] <- sapply(bias.weights[[i]], function(x) {x / total})
+}
+```
+Save the two sums datasets and the bias weights datasets to CSVs.
+```{r}
+write.csv(bias.weights, "bias_weights.csv", row.names=FALSE, quote=FALSE)
+sums.a1.nogeo <- sf::st_drop_geometry(sums.a1)
+sums.a2.nogeo <- sf::st_drop_geometry(sums.a2)
+write.csv(sums.a1.nogeo, "a1_present_in_n_quads.csv", row.names=FALSE, quote=FALSE)
+write.csv(sums.a2.nogeo, "a2_present_in_n_quads.csv", row.names=FALSE, quote=FALSE)
+```
+
+
+
+Apply bias adjustments to freq.a1
+```{r}
+bias.lon <- bias.lat <- bias.ele <- bias.coast <- vector()
+for (i in common.species) {
+  # longitude (m)
+  lon <- mean(me.county$da.lon * bias.weights[[i]])
+  bias.lon <- c(bias.lon, lon)
+  # latitude (m)
+  lat <- mean(me.county$da.lat * bias.weights[[i]])
+  bias.lat <- c(bias.lat, lat)
+  # elevation (m)
+  ele <- mean(me.county$da.ele * bias.weights[[i]])
+  bias.ele <- c(bias.ele, ele)
+  # distance to coast (m)
+  coast <- mean(me.county$da.coast * bias.weights[[i]])
+  bias.coast <- c(bias.coast, coast)
+}
+freq.a1 <- b.freq.a1 %>% 
+  mutate(lon = lon + bias.lon) %>%
+  mutate(lat = lat + bias.lat) %>% 
+  # changing the name of avg elevation to elevation for consistency 
+  # (these values are all averages)
+  mutate(ele = avg.ele + bias.ele) %>% 
+  mutate(d.to.coast = d.to.coast + bias.coast)
+
+
+freq.a1$d.to.coast
+```
+
+Create new columns in freq.a2 representing change since atlas 1.
+A southern, western, or decreasing shift from A1 to A2 
+will be represented as a negative value.
+```{r}
+# no coverage bias in a2
+freq.a2 <- b.freq.a2 %>% 
+  mutate(lat.change = lat - freq.a1$lat) %>% 
+  mutate(lon.change = lon - freq.a1$lon) %>% 
+  mutate(ele.change = avg.ele - freq.a1$avg.ele) %>% 
+  mutate(coast.change = d.to.coast - freq.a1$d.to.coast)
+```
+
+
+THIS NEXT CHUNK CONTAINS ENTIRELY OUTDATE CODE TO COMPARE THE OLD BIAS ADJUSTMENT
+Calculate outdated coverage bias for all 4 categories
+(lat, lon, elevation, distance from coast)
+Then apply those bias adjustments to o.freq.a1
+o stands for old biases
+```{r}
+w_centroid <- function(atlas) {
+  coords <- st_coordinates(atlas$centroid)
+  # this weights the a1 coordinates of the subjective 0 1 2 coverage 
+  # classification system
+  weighted_coords <- coords * atlas$coverage
+  sum_weighted_coords <- colSums(weighted_coords)
+  total_coverage <- sum(atlas$coverage)
+  weighted_centroid <- sum_weighted_coords / total_coverage
+  weighted_centroid_sf <- st_point(weighted_centroid)
+  return(weighted_centroid_sf)
+}
+# coverage center change plot
+# centroid_1 <- w_centroid(bba1m)
+# str(centroid_1)
+cov.centroids <- c(w_centroid(bba1m), w_centroid(bba2m))
+cov.centroids
+coords <- st_coordinates(cov.centroids)
+
+list_of_points <- split(coords, seq(nrow(coords)))
+
+sf_multipoint <- st_sfc(st_multipoint(do.call(rbind, list_of_points)))
+
+sf_multipoint <- st_set_crs(sf_multipoint, 32619)
+
+
+coords <- st_coordinates(sf_multipoint)
+coverage.centroids <- as.data.frame(coords)
+coverage.centroids <- 
+  coverage.centroids[, -((ncol(coverage.centroids) - 1):ncol(coverage.centroids))]
+
+# Rename columns for easier plotting
+colnames(coverage.centroids) <- c("lon", "lat")
+coverage.centroids$point_id <- factor(c("A1", "A2"))
+# Create the plot using ggplot2
+plot.coverage.centroids <- maine_quads +
+  geom_point(data = coverage.centroids, aes(x = lon, y = lat, color = point_id), size = 1) +
+  theme_minimal() +
+  labs(title = "Coverage Centroid for A1 and A2") +
+  coord_sf(crs = st_crs(32619)) +
+  theme(legend.position = "right")
+coverage.centroids
+plot.coverage.centroids
+
+#########
+# Calculate da.lat
+# all adjustments except elevation are in meters
+# latitude
+da.lat <- coverage.centroids$lat[[1]] - coverage.centroids$lat[[2]]
+paste0('latitudinal bias: ', da.lat, ' meters')
+
+#longitude
+da.lon <- coverage.centroids$lon[[1]] - coverage.centroids$lon[[2]]
+paste0('longitudinal bias: ', da.lon, ' meters')
+
+# change in elevation is measured in m
+bba1m$w.ele.cov <- bba1m$avg.ele * bba1m$coverage
+bba2m$w.ele.cov <- bba2m$avg.ele * bba2m$coverage
+da.ele <- mean(bba1m$w.ele.cov - bba2m$w.ele.cov)
+paste0('elevation bias: ', da.ele, ' meters')
+
+
+#coast
+bba1m$w.coast.cov <- bba1m$distance_to_coast * bba1m$coverage
+bba2m$w.coast.cov <- bba2m$distance_to_coast * bba2m$coverage
+da.coast <- mean(bba1m$w.coast.cov - bba2m$w.coast.cov)
+paste0('coastal distance bias: ', da.coast, ' meters')
+
+
+o.freq.a1 <- b.freq.a1 %>% 
+  mutate(lat = lat + da.lat) %>% 
+  mutate(lon = lon + da.lon) %>% 
+  mutate(avg.ele = avg.ele + da.ele) %>% 
+  mutate(d.to.coast = d.to.coast + da.coast)
+o.freq.a1
+
+o.freq.a2 <- b.freq.a2 %>% 
+  mutate(lat.change = lat - o.freq.a1$lat) %>% 
+  mutate(lon.change = lon - o.freq.a1$lon) %>% 
+  mutate(ele.change = avg.ele - o.freq.a1$avg.ele) %>% 
+  mutate(coast.change = d.to.coast - o.freq.a1$d.to.coast)
+```
+
+Create a data.frame to compare unadjusted, old bias adjustments, and new bias adjustments
+```{r}
+
+b.bias.compare <- data.frame(
+  species = freq.a2$species,
+  Family = freq.a2$Family,
+  adjustment = "unadjusted",
+  # b stands for biased
+  lat.change = b.freq.a2$lat.change,
+  lon.change = b.freq.a2$lon.change,
+  ele.change= b.freq.a2$ele.change,
+  coast.change = b.freq.a2$coast.change
+)
+o.bias.compare <- data.frame(
+  species = freq.a2$species,
+  Family = freq.a2$Family,
+  adjustment = "state", # old
+  # o stands for old bias adjustment
+  lat.change = o.freq.a2$lat.change,
+  lon.change = o.freq.a2$lon.change,
+  ele.change = o.freq.a2$ele.change,
+  coast.change = o.freq.a2$coast.change
+)
+
+c.bias.compare <- data.frame(
+  species = freq.a1$species,
+  Family = freq.a2$Family,
+  adjustment = "county",
+  # updated bias adjustment
+  lat.change = freq.a2$lat.change,
+  lon.change = freq.a2$lon.change,
+  ele.change = freq.a2$ele.change,
+  coast.change = freq.a2$coast.change
+)
+bias.compare <- rbind(c.bias.compare, o.bias.compare, b.bias.compare)
+bias.compare
+write.csv(bias.compare, "bias_comparison.csv", row.names=FALSE, quote=FALSE)
+bias.compare.county <- rbind(c.bias.compare, b.bias.compare)
+```
+Plot adjustment comparison
+```{r}
+# 
+# ggplot(bias.compare, aes(x = species, y = lon, color = adjustment)) +
+#   geom_point() + 
+#   labs(title = "A1 at Various Bias Adjustments", 
+#        x = "species", y = "Variable", color = "adjustment type") +
+#   theme_minimal()
+```
+
+
+Duplicate the freq data.frames to use km as units
+Elevation will still be in meters
+```{r}
+# divide by 1000 to convert latitude and longitude values to km
+spatial.cols.a1 <- c("lat", "s.lat", "n.lat", "lon", "e.lon", "w.lon", "min.coast",
+                 "max.coast", "d.to.coast")
+
+spatial.cols.a2 <- c("lat", "s.lat", "n.lat", "lon", "e.lon", "w.lon", "min.coast",
+                 "max.coast", "d.to.coast", "lat.change", "lon.change", "coast.change")
+
+freq.a1.km <- freq.a1
+freq.a2.km <- freq.a2
+
+for (i in spatial.cols.a1) {
+  freq.a1.km <- freq.a1.km %>% 
+    mutate(!!sym(i) := !!sym(i) / 1000)
+}
+for (i in spatial.cols.a2) {
+  freq.a2.km <- freq.a2.km %>% 
+      mutate(!!sym(i) := !!sym(i) / 1000)
+}
+
+freq.a2.km
+
+# all freq.a2 datasets are adjusted for bias
+# the only difference is distance .km is measured in kilometers
+```
+
+
+
+
+Define the function to plot lat and lon changes by categorization
+Then plot bird group, family
+```{r}
+
+plot_bias_adj <- function(atlas, X, Y, col, title, x.title, y.title) {
+  ggplot(atlas, aes(x = !!sym(X), y = !!sym(Y), color = !!sym(col))) +
+    geom_hline(yintercept = 0, color = "black", linewidth = 1) +
+    geom_vline(xintercept = 0, color = "black", linewidth = 1) +
+    geom_point(size = 1) + # Increase dot size
+    labs(
+      title = title,
+      x = x.title,
+      y = y.title,
+      color = title
+    ) +
+    theme_minimal()
+}
+
+
+plot_bias_adj(atlas=bias.compare, X="lon.change", Y="lat.change", 
+           col="adjustment", title="Lat / Lon Change from A1 to A2", 
+           x.title="Longitudinal Change (m)", y.title="Latitudinal Changes (m)")
+
+plot_bias_adj(atlas=bias.compare, X="coast.change", Y="ele.change", 
+           col="adjustment", title="Elevation and Coastal Change  from A1 to A2", 
+           x.title="Change in Distance from Coast (m)", y.title="Elevation Changes (m)")
+```
+Bar chart of species bias adjustment, old adjustment, and no adjustment for each species.
+Use comparison=bias.compare to see statewide vs county vs unadjusted.
+Use comparison=bias.compare.county tp see just county vs unadjusted.
+```{r}
+species_bias_adj <- function(bird, comparison) {
+  group <- comparison %>% 
+    filter(species == bird)
+  lat.bar <- ggplot(data = group, aes(x = adjustment, y = lat.change)) +
+    # geom_point(size = 1) +
+    geom_hline(yintercept = 0, color = "black", linewidth = 1) +
+    geom_bar(stat = "identity", fill = "blue") +
+    labs(title = bird) +
+    theme_minimal()
+  lon.bar <- ggplot(data = group, aes(x = adjustment, y = lon.change)) +
+    # geom_point(size = 1) +
+    geom_hline(yintercept = 0, color = "black", linewidth = 1) +
+    geom_bar(stat = "identity", fill = "orange") +
+    labs(title = bird) +
+    theme_minimal()
+  ele.bar <- ggplot(data = group, aes(x = adjustment, y = ele.change)) +
+    # geom_point(size = 1) +
+    geom_hline(yintercept = 0, color = "black", linewidth = 1) +
+    geom_bar(stat = "identity", fill = "red") +
+    labs(title = bird) +
+    theme_minimal()
+  
+  coast.bar <- ggplot(data = group, aes(x = adjustment, y = coast.change)) +
+    # geom_point(size = 1) +
+    geom_hline(yintercept = 0, color = "black", linewidth = 1) +
+    geom_bar(stat = "identity", fill = "purple") +
+    labs(title = bird) +
+    theme_minimal()
+  grid.arrange(lat.bar, lon.bar, ele.bar, coast.bar, ncol=2)
+}
+species_bias_adj("Northern Cardinal", bias.compare)
+# species_bias_adj("Tufted Titmouse")
+species_bias_adj("Wood Thrush", bias.compare.county)
+species_bias_adj("Mourning Warbler", bias.compare.county)
+species_bias_adj("Indigo Bunting", bias.compare.county)
+species_bias_adj("Pine Warbler", bias.compare.county)
+species_bias_adj("Red-winged Blackbird", bias.compare.county)
+species_bias_adj("Alder Flycatcher", bias.compare.county)
+species_bias_adj("Wood Duck", bias.compare.county)
+```
+
+Function: plot frequencies of changes in 4 variables
+```{r}
+histo <- function(col, hue, name, unit) {
+  ggplot(freq.a2.km, aes(x = !!sym(col))) +
+  geom_histogram(binwidth = 5, fill = hue, color = "black", alpha = 0.7) +
+  geom_vline(xintercept=0, linetype="dashed",
+              color = "black", linewidth=1) +
+  labs(
+    title = name,
+    x = paste(name, unit),
+    y = "Number of Species"
+  ) +
+  theme_minimal()
+}
+
+
+histo1 <- histo('coast.change', 'skyblue', "Change in Distance to Coast from A1 to A2", '(km)')
+histo2 <- histo('lat.change', 'yellow', "Change in Latitude from A1 to A2", '(km)')
+histo3 <- histo('lon.change', 'orange', "Change in Longitude from A1 to A2", '(km)')
+histo4 <- histo('ele.change', 'purple', 'Change in Elevation from A1 to A2', '(m)')
+
+grid.arrange(histo1, histo2, histo3, histo4, ncol = 2)
+```
+
+
+Plot boundaries for any species with 40 or more occurrences
+```{r}
+plot_boundaries <- function(bird) {
+  # I use the unmodified (.u) version of the freq dfs so the boundary lines show
+  # properly on a map
+  boundary1 <- freq.a1 %>% filter(species == bird)
+  boundary2 <- freq.a2 %>% filter(species == bird)
+  # print(boundary1)
+  # print(boundary2)
+  maine_quads +
+    geom_hline(data = boundary1, aes(yintercept = s.lat, color = "S Boundary A1"),
+               show.legend = TRUE) +
+    geom_hline(data = boundary1, aes(yintercept = n.lat, color = "N Boundary A1"),
+               show.legend = TRUE) +
+    geom_hline(data = boundary2, aes(yintercept = s.lat, color = "S Boundary A2"),
+               show.legend = TRUE) +
+    geom_hline(data = boundary2, aes(yintercept = n.lat, color = "N Boundary A2"),
+               show.legend = TRUE) +
+    scale_color_manual(
+      name = "Boundary Lines",
+      values = c(
+        "S Boundary A1" = "red",
+        "N Boundary A1" = "red",
+        "S Boundary A2" = "blue",
+        "N Boundary A2" = "blue"
+      )
+    ) +
+    labs(
+      title = paste0(bird, " Latitudinal Boundaries"),
+      # title = paste0(bird, " Latitudinal Boundaries"),
+      x = "Longitude",
+      y = "Latitude"
+    ) +
+    theme_minimal()
+}
+ 
+if (generate.maps) {
+  for (i in freq.a1$species) {
+    map <- plot_boundaries(i)
+    # p.shift <- paste0("Distribution Center Shift for ", i)
+    file.shift <- paste0(i, '.jpg')
+    ggsave(filename = file.shift, path = '..\\boundary_shift_plots', plot = map,
+           dpi = 1200)
+  
+  }
+}
+# map <- plot_boundaries(freq.a1$species[1])
+# map
+# lapply(freq.a1$species, plot_boundaries)
+```
+
+
+
+Plot Elevation by bird group in atlas 2 to see relation between mean and average
+Data in centimeters according to:
+https://www.epa.gov/hydrowq/metadata-national-elevation-dataset-ned#Identification_Information
+```{r}
+ggplot(bba2m.dist, aes(x = avg.ele, y = med.ele, color = bird.group)) +
+  geom_point(size = 1) + # Increase dot size
+  labs(
+    title = "Average and Median Elevations",
+    subtitle = "for ALL birds in Atlas 2",
+    x = "Average Elevation (m)",
+    y = "Median Elevation (m)",
+    color = "Bird Group"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+common.a2$avg.ele.a1 <- common.a1$avg.ele
+ggplot(common.a2, aes(x = avg.ele, y = avg.ele.a1, color = bird.group)) +
+  geom_point(size = 1) + # Increase dot size
+  labs(
+    title = "Average Elevations for Both Atlases",
+    x = "Average Elevation A2 (m)",
+    y = "Median Elevation A1 (m)",
+    color = "Bird Group"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+ggplot(bba2m, aes(x = avg.ele, y = med.ele, color = QuadNameCo)) +
+  geom_point(size = 1) + # Increase dot size
+  labs(
+    title = "Average and Median Elevations",
+    subtitle = "for ALL blocks in Atlas 2",
+    x = "Average Elevation (cm)",
+    y = "Median Elevation (cm)",
+    color = "Bird Group"
+  ) +
+  theme_minimal() +
+  guides(color = FALSE)
+```
+
+
+Intialize center_limit function
+```{r}
+center_limit <- function(one_bird, bird, min, max, mid, plot_name, y_axis, da)
+{
+
+  common_columns <- intersect(names(freq.a1.km), names(freq.a2))
+
+  sym.mid <- ensym(mid)
+  sym.min <- ensym(min)
+  sym.max <- ensym(max)
+
+  one.bird.a2 <- freq.a2.km[, common_columns]
+
+  one.bird.a1 <- freq.a1.km[, common_columns] 
+  if (one_bird){
+    one.bird.a2 <- one.bird.a2 %>% 
+      filter(species == bird)
+    one.bird.a1 <- one.bird.a1 %>% 
+      filter(species == bird)
+  }
+
+  one.bird.a1$atlas <- "A1"
+  one.bird.a1
+  one.bird.a2$atlas <- "A2"
+  one.bird.a2
+  one.bird <- rbind(one.bird.a1, one.bird.a2)
+
+  p <- ggplot(one.bird, aes(x = atlas, y = !!sym(mid), color = bird.group)) + 
+      geom_point(position = position_dodge(width = 0.5)) +
+      labs(x = "Atlas", y = y_axis, title = plot_name) +
+      theme_minimal()
+
+  
+  if (one_bird) {
+    p <- p + geom_errorbar(aes(ymin = !!sym(min), ymax = !!sym(max)), width = 0.2,
+                           position = position_dodge(width = 0.2)) +
+      theme(legend.position = "none")
+  }
+
+  return(p)
+  print("complete H")
+}
+
+# center_limit(TRUE, "Northern Cardinal", 's.lat', 'n.lat', 'lat', "Center & Limit of Latitude for Northern Cardinal NO BIAS ADJUSTMENT", 'Latitude (m)', da.lat)
+```
+
+
+Create a center and limit plot for each species
+```{r}
+if (generate.maps) {
+  for (i in 1:nrow(freq.a1.km)) {
+    row1 <- freq.a1.km[i, ]
+    row2 <- freq.a2.km[i, ]
+    b <- unlist(row1$species)
+   
+    t.lat <- paste0("Center & Limit of Latitude for ", b)
+    t.lon <- paste0("Center & Limit of Longitude for ", b)
+    t.ele <- paste0("Center & Limit of Elevation for ", b)
+    t.c <- paste0("Center & Limit of Distance to Coast for ", b)
+    
+    p.lat <- center_limit(TRUE, b, 's.lat', 'n.lat', 'lat', t.lat, 'Latitude (km)', 
+                          da = da.lat)
+    p.lon <- center_limit(TRUE, b, 'w.lon', 'e.lon', 'lon', t.lon, 'Longitude (km)',
+                          da.lat)
+    p.ele <- center_limit(TRUE, b, 'min.ele', 'max.ele', 'avg.ele', t.ele, 
+                          'Elevation (m)', da.ele)
+    p.c <- center_limit(TRUE, b, 'min.coast', 'max.coast', 'd.to.coast', t.c,
+                 'Distance to Coast (km)', da.coast)
+   
+    file.lat <- paste0(t.lat, '.jpg')
+    file.lon <- paste0(t.lon, '.jpg')
+    file.ele <- paste0(t.ele, '.jpg')
+    file.c <- paste0(t.c, '.jpg')
+  
+    ggsave(filename = file.lat, path = '..\\center_lim_plots', plot = p.lat,
+           dpi = 1200)
+    ggsave(filename = file.lon, path = '..\\center_lim_plots', plot = p.lon,
+           dpi = 1200)
+    ggsave(filename = file.ele, path = '..\\center_lim_plots', plot = p.ele,
+           dpi = 1200)
+    ggsave(filename = file.c, path = '..\\center_lim_plots', plot = p.c,
+           dpi = 1200)
+  
+  }
+}
+
+```
+
+
+Plot centers for each of the 4 variables
+```{r}
+# center_limit(TRUE, "Alder Flycatcher", 's.lat', 'n.lat', 'lat', "Center & Limit of Latitude for Alder Flycatcher", 'Latitude (m)', da.lat)
+center_limit(FALSE, "Alder Flycatcher", 's.lat', 'n.lat', 'lat', "Center & Limit of Latitude for All Frequent Species", 'Latitude (m)', da.lat)
+
+# center_limit(TRUE, "Alder Flycatcher", 'w.lon', 'e.lon', 'lon', "Center & Limit of Longitude for Alder Flycatcher", 'Longitude (m)', da.lon)
+center_limit(FALSE, "Alder Flycatcher", 'w.lon', 'e.lon', 'lon', "Center & Limit of Longitude for All Frequent Birds", 'Longitude (m)', da.lon)
+
+# center_limit(TRUE, "Alder Flycatcher", 'min.ele', 'max.ele', 'avg.ele', "Center & Limit of Elevation for Alder Flycatcher", 'Elevation (m)', da.ele)
+center_limit(FALSE, "Alder Flycatcher", 'min.ele', 'max.ele', 'avg.ele', "Center & Limit of Elevation for All Frequent Birds", 'Elevation (m)', da.ele)
+
+# center_limit(TRUE, "Alder Flycatcher", 'min.coast', 'max.coast', 'd.to.coast', "Center & Limit of Coastal Distance for Alder Flycatcher", 'Distance to Coast (m)', da.coast)
+
+center_limit(FALSE, "Alder Flycatcher", 'min.coast', 'max.coast', 'd.to.coast', "Center & Limit of Coastal Distance for All Frequent Birds", 'Distance to Coast (m)', da.coast)
+```
+
+Split Parulidae family
+Only in freq.a2
+```{r}
+parulidae_indices <- which(freq.a2$Family == "Parulidae")
+
+# Define the split points
+n <- length(parulidae_indices)
+n
+split_points <- c(8, 16)
+
+freq.a1$Family[parulidae_indices[1:split_points[1]]] <- "Parulidae 1/3"
+freq.a1$Family[parulidae_indices[(split_points[1] + 1):split_points[2]]] <- "Parulidae 2/3"
+freq.a1$Family[parulidae_indices[(split_points[2] + 1):n]] <- "Parulidae 3/3"
+
+freq.a2$Family[parulidae_indices[1:split_points[1]]] <- "Parulidae 1/3"
+freq.a2$Family[parulidae_indices[(split_points[1] + 1):split_points[2]]] <- "Parulidae 2/3"
+freq.a2$Family[parulidae_indices[(split_points[2] + 1):n]] <- "Parulidae 3/3"
+```
+
+Initialize shift.sf data.frame to plot shift arrows on a map
+```{r}
+# A1 has no bias factor to account for
+start_coords <- st_coordinates(freq.a1$geometry) 
+end_coords <- st_coordinates(freq.a2$geometry) 
+
+# initialize linestrings
+shift_lines <- lapply(1:nrow(start_coords), function(i) {
+  st_linestring(matrix(c(start_coords[i, ], end_coords[i, ]), ncol = 2, byrow = TRUE))
+})
+# convert linestrings to sf
+shift.sf <- st_sf(geometry = st_sfc(shift_lines), crs = st_crs(freq.a1))
+shift.sf <- st_sf(species = freq.a1$species, family = freq.a1$Family,
+                  bird.group = freq.a1$bird.group, 
+                  geometry = st_sfc(shift_lines), crs = st_crs(freq.a1))
+
+
+coords <- lapply(shift.sf$geometry, function(x) st_coordinates(x))
+
+
+lat.diff <- sapply(coords, function(coord) coord[2, 2] - coord[1, 2])
+
+shift.sf$lat.shift <- lat.diff > 0
+shift.sf <- shift.sf %>% 
+  mutate(lat.shift = ifelse(lat.shift, "North", "South"))
+shift.sf
+```
+
+
+
+
+
+
+
+Map center of distribution changes with arrows
+```{r}
+# to change it back to original plots, set color to lat.shift, filter by group,
+# and change legend title
+
+families <- unique(freq.a2$Family)
+
+# define function for creating arrow maps
+arrow_map <- function(fam) {
+  shift.group <- shift.sf %>%
+    filter(family == fam)
+
+  arrows <- maine_quads +
+    geom_sf(data = shift.group, aes(geometry = geometry, color = species), arrow =
+            arrow(length = unit(0.2, "cm"))) +
+    # scale_color_manual(name = "Latitudinal Direction of Shift") +
+    theme_minimal() +
+    labs(title = paste0("Center of Distribution Shift from A1 to A2 for ", fam),
+         color = "Species")
+  return(arrows)
+}
+
+
+# apply to each family of bird species and save as a jpeg
+if (generate.maps) {
+  for (i in families) {
+    map <- arrow_map(i)
+    # p.shift <- paste0("Distribution Center Shift for ", i)
+    file.shift <- paste0(i, '.jpg')
+    ggsave(filename = file.shift, path = '..\\center_shift_plots', plot = map,
+           dpi = 1200)
+  
+  }
+}
+# shift.maps <- lapply(families, arrow_map)
+# shift.maps
+```
+
+
+
+Map center of distribution changes with arrows
+```{r}
+# to change it back to original plots, set color to lat.shift, filter by group,
+# and change legend title
+
+groups <- unique(freq.a2$bird.group)
+
+
+arrow_map_group <- function(g) {
+  shift.group <- shift.sf %>% 
+    filter(bird.group == g)
+  
+  arrows <- maine_quads +
+    geom_sf(data = shift.group, aes(geometry = geometry, color = lat.shift), arrow =
+            arrow(length = unit(0.2, "cm"))) +
+    # scale_color_manual(name = "Latitudinal Direction of Shift") +
+    theme_minimal() +
+    labs(title = paste0("Center of Distribution Shift from A1 to A2 for ", g),
+         color = "Latitudinal Direction of Shift")
+  return(arrows)
+}
+
+shift.maps <- lapply(groups, arrow_map_group)
+shift.maps
+```
+
+Create Color Scale Map for Elevation and Coastal Change
+```{r}
+c_scale_categories <- function(var, key, title) {
+  var_sym <- ensym(var)  # Convert the input to a symbol
+  print(var)
+  # Create a new categorical variable based on the specified ranges
+  freq.a2.km <- freq.a2.km %>%
+    mutate(value_category = case_when(
+      !!var_sym >= -200 & !!var_sym < -100 ~ "-200:-100",
+      !!var_sym >= -100 & !!var_sym < -50 ~ "-100:-50",
+      !!var_sym >= -50 & !!var_sym < 0 ~ "-50:0",
+      !!var_sym >= 0 & !!var_sym < 50 ~ "0:50",
+      !!var_sym >= 50 & !!var_sym < 100 ~ "50:100",
+      !!var_sym  >= 100 & !!var_sym < 200 ~ "100:200"
+    ))
+
+  # freq.a2.km <- freq.a2.km %>%
+  #    mutate(value_category = ifelse(var >= -200 & var < -100, "-200:-100", 
+  #                                   "out of range"))
+  # freq.a2.km <- freq.a2.km %>%
+  #   mutate(value_category = ifelse(var >= -100 & var < 0, "-100:0", 
+  #                                   value_category))
+  # freq.a2.km <- freq.a2.km %>%
+  #   mutate(value_category = ifelse(var >= 0 & var < 100, "0:100", 
+  #                                   value_category))
+  # freq.a2.km <- freq.a2.km %>%
+  #   mutate(value_category = ifelse(var >= 100 & var < 200, "100:200", 
+  #                                   value_category)) 
+  
+  maine_quads +
+    geom_sf(data = freq.a2.km, 
+            aes(geometry = geometry, color = value_category)) +
+    scale_color_manual(name = key, 
+                       values = c(
+                         "-200:-100" = "darkblue",
+                         "-100:-50" = "blue",
+                         "-50:0" = "lightblue",
+                         "0:50" = "pink",
+                         "50:100" = "red",
+                         "100:200" = "darkred"
+                       )) +
+    theme_minimal() +
+    labs(title = title)
+}
+
+c_scale_categories("coast.change", "Distance to Coast Change (km)", 
+                   "Current Center of Distribution & Change in Distance to Coast")
+c_scale_categories("ele.change", "Elevation Change (m)",
+                   "Current Center of Distribution & Change in Elevation")
+
+```
+
+
+
+Create a species count for each block
+```{r}
+# create atlas 1 species list to iterate through
+start_col <- which(names(bba1m) == "American Black Duck")
+end_col <- which(names(bba1m) == "Yellow-throated Vireo")
+species.a1 <- colnames(bba1m)[start_col:end_col]
+# create atlas 1 species list to iterate through
+start_col <- which(names(bba2m) == "Acadian Flycatcher")
+end_col <- which(names(bba2m) == "Yellow Warbler")
+species.a2 <- colnames(bba2m)[start_col:end_col]
+
+bba1m.species <- subset(bba1m, select = species.a1)
+bba2m.species <- subset(bba2m, select = species.a2)
+
+
+# this function returns the count of non NA values in a row
+sum_binary <-  function(row) {
+  row <- as.list(row)
+
+  # Remove the last element (which is the sf_point)
+  row <- row[-length(row)]
+  new_row <- sapply(row, function(x) ifelse(is.na(x) | x == 0, 0, 1))
+  # this statement had to be separate in order to ensure all values were numeric
+  # new_row <- sapply(row, function(x) ifelse(x == 2 | x == 0, 0, 1))
+  # print(new_row)
+  row_count <- sum(new_row)
+  return(row_count)
+}
+count.a1 <- vector()
+count.a2 <- vector()
+for (i in 1:nrow(bba1m.species)) {
+  # atlas 1
+  current_row.a1 <- bba1m.species[i, ]
+  count.a1 <- c(count.a1, sum_binary(current_row.a1))
+  # atlas 2
+  current_row.a2 <- bba2m.species[i, ]
+  count.a2 <- c(count.a2, sum_binary(current_row.a2))
+}
+
+bba1m.species <- bba1m.species %>%
+  mutate(species_count = count.a1)
+bba2m.species <- bba2m.species %>%
+  mutate(species_count = count.a2)
+
+# A1 is subtracted from A2 to show an increase overtime as positive
+bba2m.species <- bba2m.species %>%
+  mutate(count_diff = species_count - bba1m.species$species_count)
+
+bba2m.species <- bba2m.species %>%
+  mutate(diff_rank = ifelse(count_diff > 0, 'increase', 'same'))
+
+bba2m.species <- bba2m.species %>%
+  mutate(diff_rank = ifelse(count_diff < 0, 'decrease', diff_rank))
+max(bba2m.species$species_count)
+```
+
+Plot species count for each atlas and the difference
+```{r}
+ggplot() +
+  geom_sf(data = bba1m.species, aes(geometry = geometry, fill = species_count),
+          color = "black") +
+  labs(title = "Atlas 1 Species Count by Quad") +
+  theme_minimal()
+
+ggplot() +
+  geom_sf(data = bba2m.species, aes(geometry = geometry, fill = species_count),
+          color = "black") +
+  labs(title = "Atlas 2 Species Count by Quad") +
+  theme_minimal()
+
+ggplot() +
+  geom_sf(data = bba2m.species, aes(geometry = geometry, fill = count_diff),
+          color = "black") +
+  labs(title = "Atlas 2 Count - Atlas 1 Count") +
+  theme_minimal()
+
+ggplot() +
+  geom_sf(data = bba2m.species, aes(geometry = geometry, fill = diff_rank),
+          color = "black") +
+  labs(title = "Species Richness Change from A1 to A2") +
+  theme_minimal()
+```
+
+```{r}
+
+# block.covs <- st_as_sf(block.covs)
+# bba1m <- st_as_sf(bba1m)
+
+# block.covs.a1 <- st_join(block.covs, bba1m, join = st_equals)
+
+block.covs.a1 <- join_by(bba1m, block.covs)
+```
+
+
+# ANALYSIS ONGOING WORK
+Split data into train and testing
+```{r}
+# data is too small to split
+```
+
+
+PCA
+NOTE: this doesn't seem important to our analysis since we don't have that many
+significant numeric dimensions.
+```{r, error=TRUE}
+# trim data down to essential x variables and scale
+
+# I did not include family or winter biome since that seemed closely correlated
+# with bird group and summer biome respectively
+vars <- c("num.blocks", "avg.ele", "lat", "lon",
+          "d.to.coast")
+# str(freq.a2$d.to.coast)
+freq.a2.vars <-data.frame(
+  # "num.blocks" = freq.a2$num.blocks,
+  "avg.ele" = freq.a2$avg.ele,
+  "lat" = freq.a2$lat,
+  "lon" = freq.a2$lon,
+  "d.to.coast" = freq.a2$d.to.coast
+)
+freq.a2.vars <- freq.a2.vars %>% 
+  mutate(bird.group = freq.a2$bird.group) %>% 
+  mutate(Breeding.Biome = freq.a2$Breeding.Biome)
+names(freq.a2.vars)
+# freq.a2.vars <- scale(freq.a2.vars)
+freq.a2.vars
+# pca <- prcomp(freq.a2.vars,
+# 			center = TRUE, scale. = TRUE)
+
+
+# summary(pca)
+
+```
+
+
+Initialize models
+```{r, error=TRUE}
+# glm.ele <- glm(ele.change ~ bird.group + Breeding.Biome + lat + lon + avg.ele + d.to.coast, data = freq.a2, family = 'gaussian')
+
+# did different bird Families have different changes in elevation?
+glm.ele.fam <- glm(ele.change ~ Family, data = freq.a2, family = "gaussian")
+# glm.ele.fam
+
+# find mean of change in elevation
+glm.ele.mean <- glm(ele.change ~ 1, data = freq.a2, family = 'gaussian')
+# glm.ele.mean
+
+# find mean of change in elevation for each family of bird species
+# random effect for each family
+glm.ele.fmean <- lmer(ele.change ~ (1|Family), data = freq.a2)
+# glm.ele.fmean
+
+# repeat for the other 3 variables
+# latitude
+glm.lat.fam <- glm(lat.change ~ Family, data = freq.a2, family = "gaussian")
+glm.lat.mean <- glm(lat.change ~ 1, data = freq.a2, family = 'gaussian')
+glm.lat.fmean <- lmer(lat.change ~ (1|Family), data = freq.a2)
+# longitude
+glm.lon.fam <- glm(lon.change ~ Family, data = freq.a2, family = "gaussian")
+glm.lon.mean <- glm(lon.change ~ 1, data = freq.a2, family = 'gaussian')
+glm.lon.fmean <- lmer(lon.change ~ (1|Family), data = freq.a2)
+# distance to coast
+glm.coast.fam <- glm(coast.change ~ Family, data = freq.a2, family = "gaussian")
+glm.coast.mean <- glm(coast.change ~ 1, data = freq.a2, family = 'gaussian')
+glm.coast.fmean <- lmer(coast.change ~ (1|Family), data = freq.a2)
+
+glm.lat.mean
+
+```
+
+Initialize coefficient data.frame
+```{r, error=TRUE}
+# simple family function
+fam_list <- list(
+  glm.coast.fam = glm.coast.fam,
+  glm.lon.fam = glm.lon.fam,
+  glm.lat.fam = glm.lat.fam,
+  glm.ele.fam = glm.ele.fam
+  )
+coef.df.fam <- do.call(rbind, lapply(fam_list, function(model) {
+  data.frame(t(coef(model)))
+}))
+colnames(coef.df.fam) <- sort(unique(freq.a1$Family))
+coef.df.fam
+# # simple mean function
+mean_list <- list(
+  glm.coast = glm.coast.mean,
+  glm.lon = glm.lon.mean,
+  glm.lat = glm.lat.mean,
+  glm.ele = glm.ele.mean)
+coef.df.mean <- do.call(rbind, lapply(mean_list, function(model) {
+  data.frame(t(coef(model)))
+}))
+# colnames(coef.df.mean) <- sort(unique(freq.a1$Family))
+coef.df.mean
+
+# 
+fmean_list <- list(
+  glm.coast = glm.coast.fmean,
+  glm.lon = glm.lon.fmean,
+  glm.lat = glm.lat.fmean,
+  glm.ele = glm.ele.fmean)
+coef.df.mean <- do.call(rbind, lapply(fmean_list, function(model) {
+  data.frame(t(summarize(model)))
+}))
+colnames(coef.df.mean) <- sort(unique(freq.a1$Family))
+coef.df.fmean
+```
+
+
+
+
+DHARMa
+```{r, error=TRUE}
+all.models <- list(
+  glm.ele.fmean, glm.ele.fam, glm.ele.mean,
+  glm.coast.fmean, glm.coast.fam, glm.coast.mean,
+  glm.lon.fmean, glm.lon.fam, glm.lon.mean,
+  glm.lat.fmean, glm.lat.fam, glm.lat.mean
+)
+
+# If you prefer to store the model names as strings
+all.model.names <- c(
+  'glm.ele.fmean', 'glm.ele.fam', 'glm.ele.mean',
+  'glm.coast.fmean', 'glm.coast.fam', 'glm.coast.mean',
+  'glm.lon.fmean', 'glm.lon.fam', 'glm.lon.mean',
+  'glm.lat.fmean', 'glm.lat.fam', 'glm.lat.mean'
+)
+if (generate.maps) {
+  for (i in all.model.names) {
+    simulationOutput <- simulateResiduals(fittedModel = get(i))
+    dharma_plot <- plot(simulationOutput)
+    file.shift <- paste0(i, '.jpg')
+    ggsave(filename = file.shift, path = '..\\dharma_plots', plot = dharma_plot,
+           dpi = 1200)
+  }
+}
+```
+
+
+
