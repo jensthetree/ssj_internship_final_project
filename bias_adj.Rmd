@@ -1,0 +1,432 @@
+---
+title: "bias_adj"
+output: html_document
+date: "2025-03-19"
+---
+
+```{r}
+require(sf)
+require(dplyr)
+require(tidyr)
+```
+
+Set the crs used in all analysis as a variable.
+```{r}
+crs.m <- 32619
+```
+
+Read in data 
+```{r}
+# regular
+bba1m <- readRDS("rds-files\\bba1m.rds") # read in cell below from dif source
+bba2m <- readRDS("rds-files\\bba2m.rds")
+common.a1 <- readRDS("rds-files\\common_species1.rds")
+common.a2 <- readRDS("rds-files\\common_species2.rds")
+
+
+# minimum coverage.w
+bba1m.min <- readRDS("rds-files\\bba1m_min_cov.rds")
+bba2m.min <- readRDS("rds-files\\bba2m_min_cov.rds")
+common.a1.min <- readRDS("rds-files\\common_species1_min.rds")
+common.a2.min <- readRDS("rds-files\\common_species2_min.rds")
+
+#misc.
+bba1m.dist <- readRDS("rds-files\\bba1m_distribution.rds")
+bba2m.dist <- readRDS("rds-files\\bba2m_distribution.rds")
+block.covs <- readRDS("rds-files\\land_coverage_by_block.rds")
+block.covs <- readRDS("rds-files\\block.covs.rds")
+
+# this shapefile is not included in the repo, but is not important for any code
+shape <- read_sf(dsn = "..\\state_outline", layer = "State_Outline_v5") 
+```
+
+Create bias weights based on Confirmed cases and coverage classification
+```{r}
+bba1m <- bba1m %>%
+  mutate(coverage = ifelse(Minimum.coverage == "Minimum", 
+                           "(2) Minimum", "(3) Insufficient"))
+bba1m <- bba1m %>% 
+  mutate(n_birds = Conf + Poss + Prob) %>% 
+  mutate(coverage = ifelse(Adequate.coverage == "Adequate", 
+                                "(1) Adequate", coverage)) 
+bba1m <- bba1m %>% 
+  mutate(coverage = ifelse(n_birds == 0, "(4) None", coverage)) %>% 
+  mutate(coverage = ifelse(is.na(coverage),"(4) None", coverage))
+table(bba1m$coverage)
+
+bba1m <- bba1m %>%
+  group_by(coverage) %>% 
+  mutate(coverage.w = mean(Conf)) %>% 
+  ungroup()
+
+```
+
+
+Read in counties .shp file from 
+https://www.census.gov/geographies/mapping-files/time-series/geo/cartographic-boundary.html
+
+and perform a spatial join between the county polygons and the quads
+```{r}
+me.county <- read_sf("counties-shape")
+me.county <- me.county %>% 
+  group_by(COUNTYFP) %>%
+  summarize(geometry = st_union(geometry))
+me.county <- st_transform(me.county, crs.m)
+# spatial join
+a1.c <- bba1m %>%
+  mutate(quad.lon = st_coordinates(centroid)[, 1]) %>%
+	mutate(quad.lat = st_coordinates(centroid)[, 2]) %>% 
+  st_join(me.county, join = st_nearest_feature)
+# repeat spatial join for a2
+a2.c <- bba2m %>%
+  mutate(quad.lon = st_coordinates(centroid)[, 1]) %>%
+	mutate(quad.lat = st_coordinates(centroid)[, 2]) %>% 
+  st_join(me.county, join = st_nearest_feature)
+a1.c
+```
+
+
+Initialize data frame containing each county's:
+weighted centroids, weighted elevations, and weighted distance to coast data
+Calculating little theta (part 1)
+@eq-county_bias
+```{r}
+frame.a1.c <- a1.c %>% 
+  group_by(COUNTYFP) %>%
+  # make sure coverage.w weights sum to 1
+  mutate(coverage.w = coverage.w / sum(coverage.w)) %>% 
+  reframe(w.lon = weighted.mean(quad.lon, coverage.w),
+          w.lat = weighted.mean(quad.lat, coverage.w),
+          w.ele = weighted.mean(avg.ele, coverage.w),
+          w.coast = weighted.mean(d.to.coast, coverage.w),
+          lon = mean(quad.lon),
+          lat = mean(quad.lat),
+          ele = mean(avg.ele),
+          coast = mean(d.to.coast)
+          )
+
+
+me.county <- me.county %>%
+  left_join(frame.a1.c, by = "COUNTYFP")
+
+
+me.county
+
+```
+
+Calculate county-specific coverage.w bias for all 4 categories
+Calculating little theta (part 2)
+@eq-county_bias
+da. = distance adjusted
+```{r}
+me.county <- me.county %>% 
+  mutate(da.lon.county = lon - w.lon) %>% 
+  mutate(da.lat.county = lat - w.lat) %>% 
+  mutate(da.ele.county = ele - w.ele) %>% 
+  mutate(da.coast.county = coast - w.coast)
+me.county$centroid <- st_as_sf(me.county, coords = c("lon", "lat"), crs = crs.m)
+me.county$w.centroid <- st_as_sf(me.county, coords = c("w.lon", "w.lat"), crs = crs.m)
+
+me.county
+saveRDS(me.county, "rds-files\\county_avgs.rds")
+```
+
+Initialize a species list for each county
+and species_by_county: a function that takes in an atlas and its corresponding
+species list and returns a data.frame with the number of times each species 
+occurs in each county and the number of quads in that county.
+```{r}
+# create atlas 1 species list to iterate through
+start_col <- which(names(bba1m) == "American Black Duck")
+end_col <- which(names(bba1m) == "Yellow-throated Vireo")
+species.a1 <- colnames(bba1m)[start_col:end_col]
+# create atlas 2 species list to iterate through
+start_col <- which(names(bba2m) == "Acadian Flycatcher")
+end_col <- which(names(bba2m) == "Yellow Warbler" )
+species.a2 <- colnames(bba2m)[start_col:end_col]
+
+
+species_by_county <- function(atlas, species) {
+  sums.atlas <- subset(me.county, select=c('COUNTYFP'))
+  # find the number of quads a species is in for each county
+  for(s in species) {
+    atlas <- atlas %>%
+  	  mutate(across(all_of(s), ~ ifelse(is.na(.), 0, .))) %>%
+  	  mutate(across(all_of(s), ~ ifelse(. > 0, 1, 0)))
+  	single.sums <- atlas %>%
+    	group_by(COUNTYFP) %>%
+    	reframe(!!sym(s) := sum(!!sym(s)))
+  	sums.atlas <- left_join(sums.atlas, single.sums, by = "COUNTYFP")
+
+  }
+  # create a data.frame with a column n that contains the number of quads for each county
+  quads.c <- atlas %>% 
+      group_by(COUNTYFP) %>% 
+      tally()
+  quads.c <- sf::st_drop_geometry(quads.c)
+  sums.atlas <- left_join(sums.atlas, quads.c, by = 'COUNTYFP')
+  return(sums.atlas)
+  
+}
+```
+
+
+
+Produce sums.a1 and sums.a2 data.frames using species_by_county().
+These data.frames contain the number of quads a species occurs in within each county
+and the total number of quads each county contains.
+```{r}
+# # load in fresh bbam datasets with counties
+# # c stands for county
+# a1.c <- by_county(bba1m, FALSE)
+# a2.c <- by_county(bba2m, FALSE)
+
+sums.a1 <- species_by_county(a1.c, species.a1)
+sums.a2 <- species_by_county(a2.c, species.a2)
+sums.a2
+```
+
+Create a frequency weight for each species in each county
+and add them as new county columns to freq.a1 and freq.a2
+```{r}
+frequency.vals <- data.frame(
+  COUNTYFP = sums.a1$COUNTYFP
+)
+# initialize biases as values in the range 0 - 1
+# this is the weight at which the bias adjustment will be applied
+# for each species in each county
+for (i in common.species) {
+  frequency.vals[[i]]  <- (sums.a1[[i]] + sums.a2[[i]]) / (sums.a2$n * 2)
+}
+
+# find the total bias of each county
+frequency.vals <- frequency.vals %>% 
+  rowwise() %>% 
+  mutate(total_county_bias = sum(c_across(-1)))
+# scale frequency values such that sum = 1
+for (i in common.species) {
+  total <- sum(frequency.vals[[i]])
+  frequency.vals[[i]] <- sapply(frequency.vals[[i]], function(x) {x / total})
+}
+```
+
+Save the two sums datasets and the frequency weights datasets to CSVs.
+```{r}
+write.csv(frequency.vals, "frequency_vals.csv", row.names=FALSE, quote=FALSE)
+sums.a1.nogeo <- sf::st_drop_geometry(sums.a1)
+sums.a2.nogeo <- sf::st_drop_geometry(sums.a2)
+write.csv(sums.a1.nogeo, "a1_present_in_n_quads.csv", row.names=FALSE, quote=FALSE)
+write.csv(sums.a2.nogeo, "a2_present_in_n_quads.csv", row.names=FALSE, quote=FALSE)
+```
+
+statewide bias adjustment
+repeat the bias adjustment process without adjusting for county weights
+```{r}
+# load in fresh a1 data
+a1.me <- bba1m %>%
+  mutate(quad.lon = st_coordinates(centroid)[, 1]) %>%
+	mutate(quad.lat = st_coordinates(centroid)[, 2])
+# calculate statewide geographic averages, weighted and unweighted
+a1.me <- a1.me %>% 
+  mutate(coverage.w = coverage.w / sum(coverage.w)) %>% 
+  summarize(w.lon = weighted.mean(quad.lon, coverage.w),
+          w.lat = weighted.mean(quad.lat, coverage.w),
+          w.ele = weighted.mean(avg.ele, coverage.w),
+          w.coast = weighted.mean(d.to.coast, coverage.w),
+          lon = mean(quad.lon),
+          lat = mean(quad.lat),
+          ele = mean(avg.ele),
+          coast = mean(d.to.coast)
+          )
+# calculate a single da value for each geographic variable
+# representing weighted - regular
+a1.me <- a1.me %>% 
+  mutate(
+    da.lon.old = lon - w.lon,
+    da.lat.old = lat - w.lat,
+    da.ele.old = ele - w.ele,
+    da.coast.old = coast - w.coast
+    )
+```
+
+Create data.frames representing only species that occur in at least 40 quads
+```{r}
+# initialize frequent lists containing any species w 40 or more quads
+# b stands for biased
+b.freq.a1 <- common.a1 %>% 
+  filter(num.blocks > 39)
+freq.a2 <- common.a2 %>% 
+  filter(num.blocks > 39) 
+print(1)
+b.freq.a1$d.to.coast
+freq.a2$d.to.coast
+
+# initialize freq data.frames for only the quads covered in A1
+freq.a1.min <- common.a1.min %>% 
+  filter(num.blocks > 39)
+freq.a2.min <- common.a2.min %>% 
+  filter(num.blocks > 39) 
+
+
+# make sure they contain only species in both species lists
+common.species <- intersect(b.freq.a1$species, freq.a2$species)
+b.freq.a1 <- b.freq.a1 %>% 
+  filter(species %in% common.species)
+freq.a2 <- freq.a2 %>% 
+  filter(species %in% common.species)
+b.freq.a1$d.to.coast
+freq.a1.min <- freq.a1.min %>% 
+  filter(species %in% common.species)
+freq.a2.min <- freq.a2.min %>% 
+  filter(species %in% common.species)
+
+print(2)
+b.freq.a1$d.to.coast
+freq.a2$d.to.coast
+
+common.cols <- intersect(names(b.freq.a1), names(freq.a2))
+b.freq.a1 <- b.freq.a1[common.cols]
+freq.a2 <- freq.a2[common.cols]
+
+common.cols.min <- intersect(names(freq.a1.min), names(freq.a2.min))
+freq.a1.min <- freq.a1.min[common.cols.min]
+freq.a2.min  <- freq.a2.min[common.cols.min]
+names(freq.a1.min)
+
+# ensure the same order of species
+b.freq.a1 <- b.freq.a1 %>% arrange(species)
+freq.a2 <- freq.a2 %>% arrange(species)
+freq.a1.min <- freq.a1.min %>% arrange(species)
+freq.a2.min <- freq.a2.min %>% arrange(species)
+# this last line ensures common.species is in the proper order
+# which will become important when applying bias adjustments
+common.species <- b.freq.a1$species
+```
+
+Apply county bias adjustments to freq.a1
+Big Theta
+da. = distance adjusted
+```{r}
+da.lon <- da.lat <- da.ele <- da.coast <- vector()
+for (i in common.species) {
+  # longitude (m)
+  lon <- weighted.mean(me.county$da.lon.county, frequency.vals[[i]])
+  da.lon <- c(adj.lon, lon)
+  # latitude (m)
+  lat <- weighted.mean(me.county$da.lat.county, frequency.vals[[i]])
+  da.lat <- c(adj.lat, lat)
+  # elevation (m)
+  ele <- weighted.mean(me.county$da.ele.county, frequency.vals[[i]])
+  da.ele <- c(adj.ele, ele)
+  # distance to coast (m)
+  coast <- weighted.mean(me.county$da.coast.county, frequency.vals[[i]])
+  da.coast <- c(adj.coast, coast)
+}
+
+freq.a1 <- b.freq.a1 %>% 
+  mutate(
+    lon = lon + da.lon,
+    lat = lat + da.lat,
+    ele = avg.ele + da.ele,
+    d.to.coast = d.to.coast + da.coast
+         )
+freq.a1$geometry
+####### converting the bias adjustment into the actual geometry is not working
+# freq.a1 <- st_drop_geometry(freq.a1)
+# pt.vect <- vector()
+# coord.lat <- freq.a1$lat
+# coord.lon <- freq.a1$lon
+# 
+# for (i in length(coord.lat)) {
+#   pt <- st_point(c(coord.lat[i], coord.lon[i]))
+#   pt.vect <- c(pt.vect, pt)
+# }
+# pt.vect <- st_sfc(pt.vect)
+
+```
+
+Apply state (old) bias adjustment to freq.a1 
+```{r}
+o.freq.a1 <- b.freq.a1 %>% 
+  mutate(
+    lon = lon + a1.me$da.lon.old,
+    lat = lat + a1.me$da.lat.old,
+    avg.ele = avg.ele + a1.me$da.ele.old,
+    d.to.coast = d.to.coast + as.numeric(a1.me$da.coast.old)
+    )
+```
+
+Create new columns in freq.a2 representing change since atlas 1.
+Repeat for un-adjusted, and state-adjustment
+```{r}
+# this function subtracts geographic freq.a1 values from freq.a2
+# the inputs determine which bias adjustment is used
+# it is only used in this chunk
+add_change_columns <- function(a1) {
+# there are three options for a1
+# un-adjusted: b.freq.a1
+# county-adjusted: freq.a1
+# state-adjusted: old.freq.a1
+  new.freq.a2 <- freq.a2 %>% 
+      mutate(
+    lat.change = lat - a1$lat,
+    lon.change = lon - a1$lon, 
+    ele.change = avg.ele - a1$avg.ele,
+    coast.change = d.to.coast - a1$d.to.coast,
+    s.lat.change = s.lat - a1$s.lat,
+    n.lat.change = n.lat - a1$n.lat,
+    max.ele.change = max.ele - a1$max.ele
+    )
+  return(new.freq.a2)
+}
+  
+  
+  
+freq.a2 <- add_change_columns(freq.a1)
+b.freq.a2 <- add_change_columns(b.freq.a1)
+o.freq.a2 <- add_change_columns(o.freq.a1)
+```
+
+Duplicate the county adjusted freq data.frames to use km as units
+Elevation will still be in meters
+```{r}
+# divide by 1000 to convert latitude and longitude values to km
+spatial.cols.a1 <- c("lat", "s.lat", "n.lat", "lon", "e.lon", "w.lon", "min.coast",
+                 "max.coast", "d.to.coast")
+
+spatial.cols.a2 <- c("lat", "s.lat", "n.lat", "lon", "e.lon", "w.lon", "min.coast",
+                 "max.coast", "d.to.coast", "lat.change", "lon.change", "coast.change")
+
+freq.a1.km <- freq.a1
+freq.a2.km <- freq.a2
+
+for (i in spatial.cols.a1) {
+  freq.a1.km <- freq.a1.km %>% 
+    mutate(!!sym(i) := !!sym(i) / 1000)
+}
+for (i in spatial.cols.a2) {
+  freq.a2.km <- freq.a2.km %>% 
+      mutate(!!sym(i) := !!sym(i) / 1000)
+}
+
+freq.a2.km
+
+# all freq.a2 datasets are adjusted for bias
+# the only difference is distance .km is measured in kilometers
+```
+
+Save all 6 freq datasets as RDS files
+```{r}
+# A1
+saveRDS(object = freq.a1, file = "rds-files\\county_freq_a1.rds")
+saveRDS(object = o.freq.a1, file = "rds-files\\state_freq_a1.rds")
+saveRDS(object = b.freq.a1, file = "rds-files\\biased_freq_a1.rds")
+saveRDS(object = freq.a1.km, file = "rds-files\\freq_a1_km.rds")
+saveRDS(object = bba1m, file = "rds-files\\bba1m.rds")
+# A2
+saveRDS(object = freq.a2, file = "rds-files\\county_freq_a2.rds")
+saveRDS(object = o.freq.a2, file = "rds-files\\state_freq_a2.rds")
+saveRDS(object = b.freq.a2, file = "rds-files\\biased_freq_a2.rds")
+saveRDS(object = freq.a2.km, file = "rds-files\\freq_a2_km.rds")
+```
+
