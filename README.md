@@ -1,4 +1,4 @@
-# BRI Public Report
+# BRI Research (2024-2025) Public Report
 This repository contains all the raw code of my work for BRI studying bird species distribution shifts in Maine.
 No raw data  are included in this repository as they are the property of BRI.
 Although they cannot be run without the raw data, the ```.Rmd``` files run on R version ```4.4.1``` and follow this pipeline:
